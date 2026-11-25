@@ -19,6 +19,11 @@ from app.tools.audio_mixing import concatenate_audio_tool, select_bgm_tool, mix_
 from app.tools.qwen_omni_understanding import qwen_omni_understand_tool
 from app.tools.skill_tools import read_skill_file_tool, list_skill_dir_tool, init_skill_tool, write_skill_file_tool, delete_skill_file_tool
 from app.tools.workspace_tools import write_memory
+from app.tools.character_tools import (
+    register_character_tool,
+    list_characters_tool,
+    update_character_reference_tool,
+)
 from app.llm.factory import create_llm
 from app.services import workspace_service
 
@@ -60,6 +65,10 @@ def create_agent():
         delete_skill_file_tool,
         # Workspace 记忆写入工具
         write_memory,
+        # 多角色一致性：角色注册表管理（register/list/update）
+        register_character_tool,
+        list_characters_tool,
+        update_character_reference_tool,
     ]
     logger.info(f"🛠️  注册工具: {[tool.name for tool in tools]}")
 

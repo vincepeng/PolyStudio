@@ -9,7 +9,7 @@ import uuid
 import base64
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Union
+from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -432,48 +432,90 @@ def generate_volcano_image_tool(prompt: str, size: str = "1:1") -> str:
 class EditVolcanoImageInput(BaseModel):
     """火山引擎图像编辑输入参数"""
     prompt: str = Field(description="图像编辑的提示词，详细描述想要达到的效果，支持中英文")
-    image_url: str = Field(description="需要编辑的源图片URL或本地路径（/storage/images/...）")
+    image_url: Optional[str] = Field(
+        default=None,
+        description="单参考图编辑：源图片本地路径（/storage/images/...）。与 image_urls 互斥，二选一"
+    )
+    image_urls: Optional[List[str]] = Field(
+        default=None,
+        description="多参考图编辑（多角色同框）：参考图本地路径列表，1-3 张，数组顺序需与 prompt 中角色出场/站位顺序一致。"
+                    "与 image_url 互斥，二选一；同一镜头最多 3 个角色"
+    )
     size: str = Field(default="1:1", description="输出图片尺寸，支持宽高比枚举（1:1, 4:3, 3:4, 16:9, 9:16, 3:2, 2:3, 21:9）或自定义格式（如 2048x2048），默认 1:1")
 
 
 @tool("edit_volcano_image", args_schema=EditVolcanoImageInput)
-def edit_volcano_image_tool(prompt: str, image_url: str, size: str = "1:1") -> str:
+def edit_volcano_image_tool(
+    prompt: str,
+    image_url: Optional[str] = None,
+    image_urls: Optional[List[str]] = None,
+    size: str = "1:1"
+) -> str:
     """
-    火山引擎图片编辑服务（Seedream 4.0-4.5 API），基于已有图片和提示词生成新的图片，如保持角色一致性，场景一致性则使用edit_volcano_image_tool工具。
+    火山引擎图片编辑服务（Seedream 4.0-4.5 API），基于已有图片和提示词生成新的图片。
+    保持角色一致性、场景一致性时使用本工具。
+
+    两种参考图模式（互斥，必须二选一）：
+    - 单参考图：传 image_url，用于空镜+单角色镜头或场景编辑
+    - 多参考图：传 image_urls（1-3 张），用于多角色同框镜头；数组顺序即角色槽位顺序，
+      prompt 中必须按相同顺序逐个写明每个角色的外观锚点与空间位置（左/右/前景/后景）
 
     Args:
         prompt: 编辑提示词（支持中英文）
-        image_url: 原图URL或本地路径（如 /storage/images/xxx.png）
+        image_url: 单参考图本地路径（如 /storage/images/xxx.jpg）
+        image_urls: 多参考图本地路径列表，1-3 张
         size: 输出图片尺寸，支持宽高比枚举（1:1, 4:3, 3:4, 16:9, 9:16, 3:2, 2:3, 21:9）或自定义格式（如 2048x2048），默认 1:1
 
     Returns:
         生成的图像URL的JSON字符串或错误信息
     """
+    # 入参互斥校验：image_url 与 image_urls 必须且只能传一个
+    if bool(image_url) == bool(image_urls):
+        return json.dumps(
+            {"error": "image_url 与 image_urls 必须且只能传一个：单参考图用 image_url，多角色同框用 image_urls"},
+            ensure_ascii=False,
+        )
+    if image_urls is not None and not (1 <= len(image_urls) <= 3):
+        return json.dumps(
+            {"error": f"image_urls 参考图数量必须在 1-3 张之间，当前收到 {len(image_urls)} 张；超过 3 个角色请拆分镜头"},
+            ensure_ascii=False,
+        )
+
+    # 归一化为参考图列表，后续统一按列表处理
+    source_images = image_urls if image_urls else [image_url]
+    multi_reference = len(source_images) > 1
+
     # Mock 模式：直接返回固定的图片路径
     if MOCK_MODE:
-        logger.info(f"🎭 [MOCK模式] 编辑图像: prompt={prompt}, image_url={image_url}, size={size}")
+        logger.info(f"🎭 [MOCK模式] 编辑图像: prompt={prompt}, source_images={source_images}, size={size}")
         result = {
             'image_url': MOCK_IMAGE_PATH,
             'original_url': MOCK_IMAGE_PATH,
             'local_path': MOCK_IMAGE_PATH,
             'prompt': prompt,
-            'source_image': image_url,
+            'source_image': source_images[0],
+            'source_images': source_images,
             'provider': 'volcano',
             'mock': True,
             'message': '[MOCK] 图片已编辑并保存到本地'
         }
         return json.dumps(result, ensure_ascii=False)
-    
+
     try:
         if not VOLCANO_API_KEY:
             return "Error editing image: 未配置 VOLCANO_API_KEY（请在 backend/.env 设置，可参考 env.example）"
 
         # 解析尺寸参数
         size_value = parse_size(size)
-        logger.info(f"🖌️ 开始使用火山引擎编辑图像: prompt={prompt}, image_url={image_url}, size={size} -> {size_value}")
+        logger.info(
+            f"🖌️ 开始使用火山引擎编辑图像: prompt={prompt}, "
+            f"参考图数={len(source_images)}{'（多角色同框）' if multi_reference else ''}, "
+            f"size={size} -> {size_value}"
+        )
 
-        # 准备图片输入（支持本地文件转Base64或公网URL）
-        image_input = prepare_image_input(image_url)
+        # 准备图片输入：每张参考图单独转 Base64，单图传字符串、多图传数组
+        image_inputs = [prepare_image_input(path) for path in source_images]
+        image_input = image_inputs[0] if len(image_inputs) == 1 else image_inputs
 
         # 火山引擎图片编辑端点（使用 generations 接口，支持 image 参数）
         url = f"{VOLCANO_BASE_URL.rstrip('/')}/images/generations"
@@ -481,7 +523,7 @@ def edit_volcano_image_tool(prompt: str, image_url: str, size: str = "1:1") -> s
         payload = {
             "model": VOLCANO_EDIT_MODEL,
             "prompt": prompt,
-            "image": image_input,  # 可以是URL字符串、Base64字符串或数组
+            "image": image_input,  # 单图为字符串，多角色同框为 Base64 数组
             "size": size_value,
             "response_format": "url",
             "stream": False,
@@ -495,14 +537,22 @@ def edit_volcano_image_tool(prompt: str, image_url: str, size: str = "1:1") -> s
 
         # 打印请求参数（隐藏Base64数据和公网URL）
         payload_for_log = payload.copy()
-        if isinstance(payload_for_log.get("image"), str):
-            if payload_for_log["image"].startswith("data:image"):
+        raw_image = payload_for_log.get("image")
+        if isinstance(raw_image, str):
+            if raw_image.startswith("data:image"):
                 payload_for_log["image"] = "data:image/...;base64,<Base64数据已隐藏>"
-            elif payload_for_log["image"].startswith("http"):
+            elif raw_image.startswith("http"):
                 payload_for_log["image"] = "<公网URL已隐藏>"
+        elif isinstance(raw_image, list):
+            payload_for_log["image"] = [
+                "data:image/...;base64,<Base64数据已隐藏>" if isinstance(item, str) and item.startswith("data:image")
+                else "<公网URL已隐藏>" if isinstance(item, str) and item.startswith("http")
+                else item
+                for item in raw_image
+            ]
         
         logger.info(f"🚀 调用火山引擎编辑 API: model={payload['model']}, url={url}")
-        logger.info(f"   请求参数: {json.dumps(payload_for_log, ensure_ascii=False, indent=2)}， 原始URL: {image_url}")
+        logger.info(f"   请求参数: {json.dumps(payload_for_log, ensure_ascii=False, indent=2)}， 参考图: {source_images}")
 
         response = requests.post(url, json=payload, headers=headers, timeout=120)
 
@@ -514,18 +564,18 @@ def edit_volcano_image_tool(prompt: str, image_url: str, size: str = "1:1") -> s
         data = response.json()
         logger.info(f"📥 API响应: {json.dumps(data, ensure_ascii=False)}")
 
-        image_urls = []
+        resp_image_urls = []
         if "data" in data and isinstance(data["data"], list):
-            image_urls = [item.get("url") for item in data["data"] if item.get("url")]
+            resp_image_urls = [item.get("url") for item in data["data"] if item.get("url")]
         elif "images" in data and isinstance(data["images"], list):
-            image_urls = [item.get("url") for item in data["images"] if item.get("url")]
+            resp_image_urls = [item.get("url") for item in data["images"] if item.get("url")]
         elif "url" in data:
-            image_urls = [data["url"]]
+            resp_image_urls = [data["url"]]
 
-        if not image_urls:
+        if not resp_image_urls:
             return f"Error: No image URL in response. Response: {json.dumps(data)}"
 
-        new_image_url = image_urls[0]
+        new_image_url = resp_image_urls[0]
         local_path = download_and_save_image(new_image_url, prompt)
 
         result = {
@@ -533,7 +583,8 @@ def edit_volcano_image_tool(prompt: str, image_url: str, size: str = "1:1") -> s
             "original_url": new_image_url,
             "local_path": local_path,
             "prompt": prompt,
-            "source_image": image_url,
+            "source_image": source_images[0],
+            "source_images": source_images,
             "provider": "volcano",
             "message": "图片已编辑并保存到本地",
         }
